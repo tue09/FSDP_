@@ -44,26 +44,34 @@ def main():
     torch.cuda.set_device(args.local_rank)
     dist.init_process_group(backend="nccl")
 
-    # 2. Load tokenizer & model
     model_name = "Qwen/Qwen3-0.6B"
+
+    # 2. Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+    # 3. Load model trên CPU, tiết kiệm RAM bằng low_cpu_mem_usage
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, trust_remote_code=True, torch_dtype=torch.bfloat16
-    ).to(torch.cuda.current_device())
+        model_name,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True
+    )
 
-    # 3. Wrap with FSDP
-    model = FSDP(model)
+    # 4. Wrap model với FSDP, shards sẽ được đưa lên đúng GPU của process này
+    model = FSDP(
+        model,
+        device_id=torch.cuda.current_device(),
+    )
 
-    # 4. Load & preprocess dataset
+    # 5. Load & preprocess dataset
     raw_ds = load_dataset("yahma/alpaca-cleaned", split="train")
-    # map với tokenization + padding
     ds = raw_ds.map(
         lambda ex: preprocess(ex, tokenizer),
         batched=False,
         remove_columns=raw_ds.column_names,
     )
 
-    # 5. DataLoader với custom collate_fn
+    # 6. DataLoader với custom collate_fn
     train_loader = DataLoader(
         ds,
         batch_size=2,
@@ -73,10 +81,10 @@ def main():
         pin_memory=True,
     )
 
-    # 6. Optimizer
+    # 7. Khởi tạo optimizer
     optimizer = AdamW(model.parameters(), lr=5e-5)
 
-    # 7. Training loop
+    # 8. Training loop
     model.train()
     for epoch in range(3):
         for batch in train_loader:
@@ -93,7 +101,7 @@ def main():
             if dist.get_rank() == 0:
                 print(f"[Epoch {epoch}] loss = {loss.item():.4f}")
 
-    # 8. Save checkpoint (only rank 0)
+    # 9. Save checkpoint (only rank 0)
     if dist.get_rank() == 0:
         model.module.save_pretrained("qwen3_fsdp_sft")
 
