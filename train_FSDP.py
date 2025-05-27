@@ -4,12 +4,22 @@ import os
 import argparse
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+# PyTorch FSDP imports
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    CPUOffload,
+    ShardingStrategy,
+    BackwardPrefetch,
+    MixedPrecision,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+# 1) Data prep
 def preprocess(example, tokenizer, max_length=512):
     prompt = f"### Instruction:\n{example['instruction']}\n\n### Response:\n"
     text = prompt + example["output"]
@@ -19,59 +29,68 @@ def preprocess(example, tokenizer, max_length=512):
         padding="max_length",
         max_length=max_length,
     )
-    # labels = input_ids (model sẽ ignore token_id = -100 nếu cần)
     tok["labels"] = tok["input_ids"].copy()
     return tok
 
 def collate_fn(batch):
-    # batch là list of dicts có keys: input_ids, attention_mask, labels
     return {
-        k: torch.tensor([example[k] for example in batch], dtype=torch.long)
+        k: torch.tensor([ex[k] for ex in batch], dtype=torch.long)
         for k in batch[0]
     }
 
 def main():
-    # 1. Parse args & init process group
+    # ——————————————
+    # 0) Distributed init
+    # ——————————————
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--local_rank",
-        type=int,
-        default=int(os.environ.get("LOCAL_RANK", 0)),
-        help="Torch local rank"
-    )
+    parser.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", 0)))
     args = parser.parse_args()
 
     torch.cuda.set_device(args.local_rank)
     dist.init_process_group(backend="nccl")
 
+    # ——————————————
+    # 1) Tokenizer + Model (load trên CPU)
+    # ——————————————
     model_name = "Qwen/Qwen3-0.6B"
-
-    # 2. Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
-    # 3. Load model trên CPU, tiết kiệm RAM bằng low_cpu_mem_usage
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True
+        low_cpu_mem_usage=True,               # chừa RAM
     )
+    model.gradient_checkpointing_enable()    # tiết kiệm activation
 
-    # 4. Wrap model với FSDP, shards sẽ được đưa lên đúng GPU của process này
-    model = FSDP(
+    # ——————————————
+    # 2) Wrap FSDP
+    # ——————————————
+    fsdp = FSDP(
         model,
-        device_id=torch.cuda.current_device(),
+        sharding_strategy=ShardingStrategy.FULL_SHARD,      # shard param + grads + opt-state
+        auto_wrap_policy=transformer_auto_wrap_policy,      # chỉ wrap các block Transformer lớn
+        cpu_offload=CPUOffload(offload_params=True),        # offload params về CPU khi không dùng
+        mixed_precision=MixedPrecision(                     # bfloat16 nội bộ
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        ),
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,    # prefetch gradients
+        device_id=torch.cuda.current_device(),              # mỗi rank giữ shard trên GPU riêng
     )
+    model = fsdp
 
-    # 5. Load & preprocess dataset
-    raw_ds = load_dataset("yahma/alpaca-cleaned", split="train")
-    ds = raw_ds.map(
+    # ——————————————
+    # 3) Dataset + DataLoader
+    # ——————————————
+    raw = load_dataset("yahma/alpaca-cleaned", split="train")
+    ds = raw.map(
         lambda ex: preprocess(ex, tokenizer),
         batched=False,
-        remove_columns=raw_ds.column_names,
+        remove_columns=raw.column_names,
     )
 
-    # 6. DataLoader với custom collate_fn
     train_loader = DataLoader(
         ds,
         batch_size=2,
@@ -81,28 +100,38 @@ def main():
         pin_memory=True,
     )
 
-    # 7. Khởi tạo optimizer
+    # ——————————————
+    # 4) Optimizer & (optional) Scaler
+    # ——————————————
     optimizer = AdamW(model.parameters(), lr=5e-5)
+    scaler = torch.cuda.amp.GradScaler()  # vẫn dùng AMP wrapper nếu muốn
 
-    # 8. Training loop
+    # ——————————————
+    # 5) Training loop
+    # ——————————————
     model.train()
     for epoch in range(3):
         for batch in train_loader:
-            # Move batch to current GPU
             batch = {k: v.cuda() for k, v in batch.items()}
+            with torch.cuda.amp.autocast():  # AMP context
+                outputs = model(**batch)
+                loss = outputs.loss
 
-            outputs = model(**batch)
-            loss = outputs.loss
-            loss.backward()
-
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
 
             if dist.get_rank() == 0:
-                print(f"[Epoch {epoch}] loss = {loss.item():.4f}")
+                print(f"[Epoch {epoch}] loss={loss.item():.4f}")
 
-    # 9. Save checkpoint (only rank 0)
+    # ——————————————
+    # 6) Save checkpoint (rank0)
+    # ——————————————
     if dist.get_rank() == 0:
+        # Move full model to CPU để save
+        model.cpu()
+        # unwrap FSDP và lưu
         model.module.save_pretrained("qwen3_fsdp_sft")
 
 if __name__ == "__main__":
