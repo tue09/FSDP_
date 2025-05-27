@@ -48,7 +48,7 @@ def main():
     model_name = "Qwen/Qwen3-0.6B"
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, trust_remote_code=True
+        model_name, trust_remote_code=True, torch_dtype=torch.float16
     ).to(torch.cuda.current_device())
 
     # 3. Wrap with FSDP
