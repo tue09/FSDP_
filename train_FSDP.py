@@ -1,113 +1,84 @@
-# train_fsdp_qwen.py
+# train_fsdp_sft.py
+
 import os
+import argparse
 import torch
 import torch.distributed as dist
+from torch.utils.data import DataLoader
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import default_auto_wrap_policy
-from torch.distributed.fsdp import BackwardPrefetch, CPUOffload, MixedPrecision
-from torch.utils.data import DataLoader, DistributedSampler, Dataset
+from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    get_linear_schedule_with_warmup,
+    DataCollatorForLanguageModeling,
+    AdamW,
 )
-from torch.cuda.amp import autocast, GradScaler
-
-class TextDataset(Dataset):
-    def __init__(self, texts, tokenizer, max_length=1024):
-        self.encodings = tokenizer(texts, truncation=True, 
-                                   padding="max_length", 
-                                   max_length=max_length)
-    def __len__(self):
-        return len(self.encodings["input_ids"])
-    def __getitem__(self, idx):
-        item = {k: torch.tensor(v[idx]) 
-                for k, v in self.encodings.items()}
-        # causal LM: labels = input_ids
-        item["labels"] = item["input_ids"].clone()
-        return item
-
-def setup_process(rank, world_size):
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29500")
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-
-def cleanup():
-    dist.destroy_process_group()
 
 def main():
-    # 1. Khởi tạo multi-GPU
-    rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    setup_process(rank, world_size)
+    # 1. Parse local rank để phân GPU
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=int(os.environ.get("LOCAL_RANK", 0)),
+        help="Torch local rank"
+    )
+    args = parser.parse_args()
 
-    # 2. Tokenizer + Model (mixed-precision)
+    # 2. Khởi tạo process group và chỉ định GPU cho mỗi rank
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(backend="nccl")
+
+    # 3. Load tokenizer và model
+    model_name = "Qwen/Qwen3-0.6B"
     tokenizer = AutoTokenizer.from_pretrained(
-        "Qwen/Qwen3-0.6B", trust_remote_code=True
+        model_name, trust_remote_code=True
     )
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B",
-        torch_dtype=torch.float16,
-        device_map=None,  # để FSDP manage device
+        model_name, trust_remote_code=True
+    ).to(torch.cuda.current_device())
+
+    # 4. Quấn model với FSDP
+    model = FSDP(model)
+
+    # 5. Load và tiền xử lý dataset
+    ds = load_dataset("yahma/alpaca-cleaned", split="train")
+    def preprocess(example):
+        prompt = f"### Instruction:\n{example['instruction']}\n\n### Response:\n"
+        text = prompt + example["output"]
+        tok = tokenizer(
+            text, truncation=True, max_length=512
+        )
+        tok["labels"] = tok["input_ids"].copy()
+        return tok
+
+    ds = ds.map(preprocess, remove_columns=ds.column_names)
+    collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+    train_loader = DataLoader(
+        ds, batch_size=2, shuffle=True, collate_fn=collator
     )
 
-    # 3. Wrap model với FSDP
-    auto_wrap = default_auto_wrap_policy
-    fsdp_cfg = {
-        "mixed_precision": MixedPrecision(
-            param_dtype=torch.float16,
-            reduce_dtype=torch.float16,
-            buffer_dtype=torch.float16,
-        ),
-        "backward_prefetch": BackwardPrefetch.BACKWARD_PRE,
-        "cpu_offload": CPUOffload(offload_params=False),
-        "auto_wrap_policy": auto_wrap,
-    }
-    model = FSDP(model, **fsdp_cfg)
+    # 6. Khởi tạo optimizer
+    optimizer = AdamW(model.parameters(), lr=5e-5)
 
-    # 4. Chuẩn bị DataLoader
-    #    Giả sử bạn đã có list `train_texts`
-    train_texts = ["Your first training example...", "..."]  # thay bằng data thật
-    dataset = TextDataset(train_texts, tokenizer, max_length=1024)
-    sampler = DistributedSampler(dataset)
-    dataloader = DataLoader(dataset, batch_size=1, sampler=sampler)
-
-    # 5. Optimizer + Scheduler + AMP
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
-    total_steps = len(dataloader) * 3  # ví dụ 3 epochs
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=100, num_training_steps=total_steps
-    )
-    scaler = GradScaler()
-
-    # 6. Training loop
+    # 7. Training loop
     model.train()
     for epoch in range(3):
-        sampler.set_epoch(epoch)
-        for step, batch in enumerate(dataloader):
-            # đưa batch lên GPU
+        for batch in train_loader:
+            # Chuyển batch sang GPU tương ứng
             batch = {k: v.cuda() for k, v in batch.items()}
-            with autocast():
-                outputs = model(**batch)
-                loss = outputs.loss
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
             optimizer.zero_grad()
-            scheduler.step()
 
-            if rank == 0 and step % 20 == 0:
-                print(f"Epoch {epoch} | Step {step} | Loss {loss.item():.4f}")
+            if dist.get_rank() == 0:
+                print(f"[Epoch {epoch}] loss = {loss.item():.4f}")
 
-    # 7. Lưu checkpoint (chỉ GPU 0)
-    if rank == 0:
-        model.module.save_pretrained("qwen3_sft_fsdp")
-        tokenizer.save_pretrained("qwen3_sft_fsdp")
-
-    cleanup()
+    # 8. Lưu checkpoint chỉ ở rank 0
+    if dist.get_rank() == 0:
+        model.module.save_pretrained("qwen3_fsdp_sft")
 
 if __name__ == "__main__":
     main()
