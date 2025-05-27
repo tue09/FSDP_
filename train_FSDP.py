@@ -7,12 +7,13 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from datasets import load_dataset
+
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     DataCollatorForLanguageModeling,
-    AdamW,
 )
+from torch.optim import AdamW
 
 def main():
     # 1. Parse local rank để phân GPU
